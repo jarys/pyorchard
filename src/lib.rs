@@ -1,14 +1,12 @@
-use orchard;
-use pasta_curves::pallas;
-
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 use pyo3::wrap_pyfunction;
 use rand_chacha;
 use rand_core::SeedableRng;
 use std::convert::TryFrom;
+use std::fmt;
 
-use pasta_curves::group::ff::PrimeField;
-
+use orchard;
 use zcash_primitives::transaction::components::{amount::Amount, orchard::write_v5_bundle};
 
 #[pymodule]
@@ -89,6 +87,7 @@ impl Random {
 struct Spend {
     fvk: FullViewingKey,
     note: Note,
+    //scope: Scope,
 }
 
 #[pymethods]
@@ -186,7 +185,7 @@ impl Builder {
         Ok(Bundle(Authorization::UnprovenAndUnauthorized(Some(
             std::mem::take(&mut self.0)
                 .unwrap()
-                .build(&mut rng.0)
+                .build_online(&mut rng.0)
                 .expect("cannot build"),
         ))))
     }
@@ -226,9 +225,6 @@ impl Builder {
     }
 }
 
-#[pyclass]
-struct Builder2(Option<orchard::builder::Builder>);
-
 use orchard::{
     builder::{InProgress, InProgressSignatures, PartiallyAuthorized, Unauthorized, Unproven},
     bundle::Authorized,
@@ -248,7 +244,7 @@ fn step_create_proof<S: InProgressSignatures>(
     )
 }
 
-fn step_prepare<P>(
+fn step_prepare<P: fmt::Debug>(
     bundle: &mut Option<orchard::Bundle<InProgress<P, Unauthorized>, Amount>>,
     rng: &mut Random,
     sighash: [u8; 32],
@@ -256,20 +252,19 @@ fn step_prepare<P>(
     Some(std::mem::take(bundle).unwrap().prepare(&mut rng.0, sighash))
 }
 
-use orchard::primitives::redpallas;
-fn step_append_signature<P>(
+use orchard::primitives::redpallas::{self, SpendAuth};
+fn step_append_signatures<P: fmt::Debug>(
     bundle: &mut Option<orchard::Bundle<InProgress<P, PartiallyAuthorized>, Amount>>,
-    expected_alpha: [u8; 32],
-    signature: [u8; 64],
-    rng: &mut Random,
+    signatures: Vec<[u8; 64]>,
 ) -> Option<orchard::Bundle<InProgress<P, PartiallyAuthorized>, Amount>> {
-    let alpha = pallas::Scalar::from_repr(expected_alpha);
-    let alpha = Option::from(alpha).expect("cannot unwrap alpha");
-    let signature = redpallas::Signature::<redpallas::SpendAuth>::from(signature);
+    let signatures: Vec<redpallas::Signature<SpendAuth>> = signatures
+        .into_iter()
+        .map(redpallas::Signature::<redpallas::SpendAuth>::from)
+        .collect();
     Some(
         std::mem::take(bundle)
             .unwrap()
-            .append_signature(alpha, &signature, &mut rng.0)
+            .append_signatures(&signatures)
             .expect("cannot append a signature"),
     )
 }
@@ -379,29 +374,14 @@ impl Bundle {
         Ok(())
     }
 
-    fn append_signature(
-        &mut self,
-        expected_alpha: [u8; 32],
-        signature: [u8; 64],
-        rng: &mut Random,
-    ) -> PyResult<()> {
+    fn append_signatures(&mut self, signatures: Vec<[u8; 64]>) -> PyResult<()> {
         assert!(self.is_some());
         self.0 = match &mut self.0 {
             Authorization::UnprovenAndPartiallyAuthorized(b) => {
-                Authorization::UnprovenAndPartiallyAuthorized(step_append_signature(
-                    b,
-                    expected_alpha,
-                    signature,
-                    rng,
-                ))
+                Authorization::UnprovenAndPartiallyAuthorized(step_append_signatures(b, signatures))
             }
             Authorization::ProofAndPartiallyAuthorized(b) => {
-                Authorization::ProofAndPartiallyAuthorized(step_append_signature(
-                    b,
-                    expected_alpha,
-                    signature,
-                    rng,
-                ))
+                Authorization::ProofAndPartiallyAuthorized(step_append_signatures(b, signatures))
             }
             _ => panic!("cannot append a signature at this state"),
         };
@@ -419,7 +399,7 @@ impl Bundle {
         Ok(())
     }
 
-    fn serialized(&self) -> PyResult<Vec<u8>> {
+    fn serialized(&self, py: Python) -> PyResult<PyObject> {
         let mut serialized = Vec::<u8>::new();
         match &self.0 {
             Authorization::Authorized(b) => {
@@ -427,7 +407,7 @@ impl Bundle {
             }
             _ => panic!("cannot serialize at this state"),
         };
-        Ok(serialized)
+        Ok(PyBytes::new(py, &serialized).into())
     }
 }
 
@@ -443,7 +423,7 @@ impl ProvingKey {
 }
 
 #[pyfunction]
-fn experiment() -> PyResult<Vec<u8>> {
+fn experiment(py: Python) -> PyResult<PyObject> {
     let mut b = Builder::default();
     let o = Output::default();
     b.add_output(o)?;
@@ -454,5 +434,5 @@ fn experiment() -> PyResult<Vec<u8>> {
     b.prepare(&mut rng, sh)?;
     b.create_proof(&pk, &mut rng)?;
     b.finalize()?;
-    Ok(b.serialized()?)
+    Ok(b.serialized(py)?)
 }
